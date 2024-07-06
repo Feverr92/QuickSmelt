@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using Newtonsoft.Json;
@@ -8,7 +8,7 @@ using Random = UnityEngine.Random;
 
 namespace Oxide.Plugins
 {
-    [Info("Quick Smelt", "misticos + WhiteThunder", "5.1.14")]
+    [Info("Quick Smelt", "misticos + WhiteThunder + Feverr", "5.2")]
     [Description("Increases the speed of the furnace smelting")]
     class QuickSmelt : RustPlugin
     {
@@ -31,11 +31,18 @@ namespace Oxide.Plugins
             [JsonProperty(PropertyName = "Use Permission")]
             public bool UsePermission = true;
 
-            [JsonProperty(PropertyName = "Speed Multipliers", ObjectCreationHandling = ObjectCreationHandling.Replace)]
-            public Dictionary<string, float> SpeedMultipliers = new Dictionary<string, float>
+            [JsonProperty(PropertyName = "Items Per Invocation Multiplier", ObjectCreationHandling = ObjectCreationHandling.Replace)]
+            public Dictionary<string, float> ItemsPerInvocationMultiplier = new Dictionary<string, float>
             {
                 { "global", 1.0f },
                 { "furnace.shortname", 1.0f }
+            };
+
+            [JsonProperty(PropertyName = "Invocations Per Second", ObjectCreationHandling = ObjectCreationHandling.Replace)]
+            public Dictionary<string, float> InvocationsPerSecond = new Dictionary<string, float>
+            {
+                { "global", 2.0f }, // Default to twice per second
+                { "furnace.shortname", 2.0f }
             };
 
             [JsonProperty(PropertyName = "Fuel Usage Speed Multipliers",
@@ -116,103 +123,6 @@ namespace Oxide.Plugins
 
             [JsonProperty(PropertyName = "Debug")]
             public bool Debug = false;
-
-            public void OnServerInitialized(QuickSmelt plugin)
-            {
-                foreach (var entry in OutputMultipliers.Values)
-                {
-                    ValidateItemNames(plugin, entry.Keys);
-                }
-
-                foreach (var entry in Whitelist.Values)
-                {
-                    ValidateItemNames(plugin, entry);
-                }
-
-                foreach (var entry in Blacklist.Values)
-                {
-                    ValidateItemNames(plugin, entry);
-                }
-
-                var validFurnaceShortNames = GetValidFurnaceShortNames();
-                var validDeployables = GetItemShortNameToDeployableShortName<BaseOven>();
-                ValidateFurnaceShortNames(plugin, validFurnaceShortNames, validDeployables, SpeedMultipliers.Keys);
-                ValidateFurnaceShortNames(plugin, validFurnaceShortNames, validDeployables, FuelSpeedMultipliers.Keys);
-                ValidateFurnaceShortNames(plugin, validFurnaceShortNames, validDeployables, FuelUsageMultipliers.Keys);
-                ValidateFurnaceShortNames(plugin, validFurnaceShortNames, validDeployables, OutputMultipliers.Keys);
-                ValidateFurnaceShortNames(plugin, validFurnaceShortNames, validDeployables, Whitelist.Keys);
-                ValidateFurnaceShortNames(plugin, validFurnaceShortNames, validDeployables, Blacklist.Keys);
-            }
-
-            private void ValidateItemNames(QuickSmelt plugin, IEnumerable<string> itemShortNameList)
-            {
-                foreach (var itemShortName in itemShortNameList)
-                {
-                    if (itemShortName != "global"
-                        && itemShortName != "item.shortname"
-                        && ItemManager.FindItemDefinition(itemShortName) == null)
-                    {
-                        plugin.PrintWarning($"[Configuration] {itemShortName} is not a valid item.");
-                    }
-                }
-            }
-
-            private void ValidateFurnaceShortNames(QuickSmelt plugin, HashSet<string> validFurnaceShortNames, Dictionary<string, string> validFurnaces, IEnumerable<string> shortNameList)
-            {
-                foreach (var shortName in shortNameList)
-                {
-                    if (shortName == "global" || shortName == "furnace.shortname" || validFurnaceShortNames.Contains(shortName))
-                        continue;
-
-                    var message = $"[Configuration] {shortName} is not a valid furnace short name.";
-
-                    // People often put item short names into the config where an entity short name is expected.
-                    // This will suggest the correct name to the user: electric.furnace -> electricfurnace.deployed
-                    string furnaceShortName;
-                    if (validFurnaces.TryGetValue(shortName, out furnaceShortName))
-                    {
-                        message += $" Did you mean {furnaceShortName}?";
-                    }
-
-                    plugin.PrintWarning(message);
-                }
-            }
-
-            private static HashSet<string> GetValidFurnaceShortNames()
-            {
-                var validShortNames = new HashSet<string>();
-
-                foreach (var prefabPath in GameManifest.Current.entities)
-                {
-                    var furnace = GameManager.server.FindPrefab(prefabPath)?.GetComponent<BaseOven>();
-                    if (furnace == null)
-                        continue;
-
-                    validShortNames.Add(furnace.ShortPrefabName);
-                }
-
-                return validShortNames;
-            }
-
-            private static Dictionary<string, string> GetItemShortNameToDeployableShortName<T>() where T : BaseEntity
-            {
-                var itemsToDeployables = new Dictionary<string, string>();
-
-                foreach (var itemDefinition in ItemManager.itemList)
-                {
-                    var itemModDeployable = itemDefinition.GetComponent<ItemModDeployable>();
-                    if (itemModDeployable == null)
-                        continue;
-
-                    var entity = itemModDeployable.entityPrefab.GetEntity() as T;
-                    if (entity == null)
-                        continue;
-
-                    itemsToDeployables[itemDefinition.shortname] = entity.ShortPrefabName;
-                }
-
-                return itemsToDeployables;
-            }
         }
 
         protected override void LoadConfig()
@@ -264,7 +174,6 @@ namespace Oxide.Plugins
         private void OnServerInitialized()
         {
             _instance = this;
-            _config.OnServerInitialized(this);
             permission.RegisterPermission(PermissionUse, this);
 
             var ovens = BaseNetworkable.serverEntities.OfType<BaseOven>().ToArray();
@@ -380,7 +289,8 @@ namespace Oxide.Plugins
                 }
             }
 
-            private float _speedMultiplier;
+            private float _itemsPerInvocationMultiplier;
+            private float _invocationsPerSecond;
 
             private float _fuelSpeedMultiplier;
 
@@ -419,16 +329,20 @@ namespace Oxide.Plugins
 
             private void Awake()
             {
-                // Well, sorry for my complicated code. But that should work faster! :)
+                float modifierF;
+                int modifierI;
 
-                float modifierF; // float modifier
-                int modifierI; // int modifier
-
-                if (!_config.SpeedMultipliers.TryGetValue(Furnace.ShortPrefabName, out modifierF) &&
-                    !_config.SpeedMultipliers.TryGetValue("global", out modifierF))
+                if (!_config.ItemsPerInvocationMultiplier.TryGetValue(Furnace.ShortPrefabName, out modifierF) &&
+                    !_config.ItemsPerInvocationMultiplier.TryGetValue("global", out modifierF))
                     modifierF = 1.0f;
 
-                _speedMultiplier = modifierF;
+                _itemsPerInvocationMultiplier = modifierF;
+
+                if (!_config.InvocationsPerSecond.TryGetValue(Furnace.ShortPrefabName, out modifierF) &&
+                    !_config.InvocationsPerSecond.TryGetValue("global", out modifierF))
+                    modifierF = 2.0f; // Default to twice per second
+
+                _invocationsPerSecond = modifierF;
 
                 if (!_config.FuelSpeedMultipliers.TryGetValue(Furnace.ShortPrefabName, out modifierF) &&
                     !_config.FuelSpeedMultipliers.TryGetValue("global", out modifierF))
@@ -550,7 +464,7 @@ namespace Oxide.Plugins
                 {
                     var def = burnable.byproductItem;
                     var item = ItemManager.Create(def,
-                        (int)(burnable.byproductAmount * OutputMultiplier(def.shortname) * Mathf.Min(_speedMultiplier, fuel.amount))); // It's fuel multiplier
+                        (int)(burnable.byproductAmount * OutputMultiplier(def.shortname) * Mathf.Min(_itemsPerInvocationMultiplier, fuel.amount)));
 
                     if (!item.MoveToContainer(Furnace.inventory))
                     {
@@ -559,7 +473,7 @@ namespace Oxide.Plugins
                     }
                 }
 
-                var fuelToConsume = (int)(_fuelUsageMultiplier * _speedMultiplier);
+                var fuelToConsume = (int)(_fuelUsageMultiplier * _itemsPerInvocationMultiplier);
 
                 if (fuel.amount <= fuelToConsume)
                 {
@@ -626,7 +540,7 @@ namespace Oxide.Plugins
                     }
 
                     var cookTimeInverted = item.cookTimeLeft * -1;
-                    var amountConsumed = (int)((1 + Mathf.FloorToInt(cookTimeInverted / cookable.cookTime)) * _speedMultiplier);
+                    var amountConsumed = (int)((1 + Mathf.FloorToInt(cookTimeInverted / cookable.cookTime)) * _itemsPerInvocationMultiplier);
 
                     item.cookTimeLeft = cookable.cookTime - cookTimeInverted % cookable.cookTime;
                     amountConsumed = Math.Min(amountConsumed, item.amount);
@@ -673,8 +587,8 @@ namespace Oxide.Plugins
                 Furnace.inventory.temperature = Furnace.cookingTemperature;
                 Furnace.UpdateAttachmentTemperature();
 
-                PrintDebug($"Speed Multiplier: {_speedMultiplier}");
-                Furnace.InvokeRepeating(Cook, 0.5f, 0.5f);
+                PrintDebug($"Items Per Invocation Multiplier: {_itemsPerInvocationMultiplier}, Invocations Per Second: {_invocationsPerSecond}");
+                Furnace.InvokeRepeating(Cook, 1f / _invocationsPerSecond, 1f / _invocationsPerSecond);
                 Furnace.SetFlag(BaseEntity.Flags.On, true);
             }
 
